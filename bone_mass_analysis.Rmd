@@ -1,0 +1,440 @@
+```{r SETUP}
+options(stringsAsFactors = FALSE)
+library(Seurat)
+library(harmony)
+library(tidyverse)
+library(edgeR)
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+```
+
+Generated RNA count matrices of cells (rows) by genes (columns)
+
+QCs the data and generates the Seurat object
+
+```{r QC}
+
+samples <- data.frame(
+  path = c(
+    "~/Documents/LOOTS_DATA/AJ_filtered_feature_bc_matrix",
+    "~/Documents/LOOTS_DATA/B6stromalbone2_filtered_feature_bc_matrix",
+    "~/Documents/LOOTS_DATA/MRL_filtered_feature_bc_matrix",
+    "~/Documents/LOOTS_DATA/NZW_filtered_feature_bc_matrix"
+  ),
+  names = c(
+    "AJ", 
+    "B6", 
+    "MRL", 
+    "NZW"
+  ),
+  min_feature = c(300, 300, 300, 300),
+  max_feature = c(4000, 7500, 6000, 7000),
+  max_mt_count   = c(10, 15, 8, 8)
+)
+
+obj_list <- lapply(1:nrow(samples), function(i){
+  data <- Read10X(data.dir = samples$path[i])
+  obj <- CreateSeuratObject(counts = data, min.cells = 3, min.features = 200)
+  obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^mt-")
+  obj$which_sample <- samples$names[i]
+  obj <- subset(obj,
+    subset = nFeature_RNA > samples$min_feature[i] &
+             nFeature_RNA < samples$max_feature[i] &
+             percent.mt   < samples$max_mt_count[i]
+  )
+  obj <- obj[!grepl("^mt-", rownames(obj)), ]
+  obj <- NormalizeData(obj)
+  obj <- JoinLayers(obj)
+  obj <- FindVariableFeatures(obj, selection.method = "vst", nfeatures = 2000)
+  obj <- ScaleData(obj)
+  obj <- RunPCA(obj)
+  return(obj)
+})
+
+merged_obj <- merge(
+  x = obj_list[[1]], 
+  y = obj_list[2:4], 
+  add.cell.ids = samples$names
+)
+
+merged_obj <- NormalizeData(merged_obj)
+merged_obj <- JoinLayers(merged_obj)
+merged_obj <- FindVariableFeatures(merged_obj, selection.method = "vst", nfeatures = 2000)
+merged_obj <- ScaleData(merged_obj)
+merged_obj <- RunPCA(merged_obj)
+
+table(merged_obj$which_sample)
+
+violin_plot <- VlnPlot(merged_obj,
+                       features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+                       ncol = 3,
+                       pt.size = 0.1,
+                       group.by = "which_sample")
+ggsave("~/Desktop/BM_violin_after.png", plot = violin_plot, width = 16, height = 6, dpi = 300)
+
+plot1 <- FeatureScatter(merged_obj, feature1 = "nCount_RNA", feature2 = "percent.mt", group.by = "which_sample")
+plot2 <- FeatureScatter(merged_obj, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", group.by = "which_sample")
+combined_scatter <- plot1 + plot2
+ggsave("~/Desktop/BM_feature_scatter_after.png", plot = combined_scatter, width = 15, height = 7, dpi = 300)
+
+```
+
+Integrate all samples together
+
+```{r INTEGRATE}
+
+rm(list = setdiff(ls(), "merged_obj"))
+gc()
+
+obj_list <- SplitObject(merged_obj, split.by = "which_sample")
+integ_obj <- lapply(X = obj_list, FUN = function(x) {
+    x <- NormalizeData(x)
+    x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 2000)
+})
+rm(obj_list, merged_obj)
+gc()
+
+features <- SelectIntegrationFeatures(object.list = integ_obj)
+integ_obj <- lapply(X = integ_obj, FUN = function(x) {
+  x <- ScaleData(x, features = features)
+  x <- RunPCA(x, features = features)
+})
+
+integ_anchors <- FindIntegrationAnchors(object.list = integ_obj, anchor.features = features, reduction = "rpca")
+rm(integ_obj)
+gc()
+
+integ_final <- IntegrateData(anchorset = integ_anchors)
+DefaultAssay(integ_final) <- "integrated"
+rm(integ_anchors)
+gc()
+
+integ_final <- ScaleData(integ_final)
+integ_final <- RunPCA(integ_final)
+ElbowPlot(integ_final, ndims = 50, reduction = "pca") 
+integ_final <- RunUMAP(integ_final, reduction = "pca", dims = 1:20)
+integ_final <- FindNeighbors(integ_final, reduction = "pca", dims = 1:20)
+integ_final <- FindClusters(integ_final, resolution = 0.4)
+
+UMAP_master <- DimPlot(integ_final, reduction = "umap", label = TRUE, repel = TRUE, label.size = 9, label.box = TRUE) + 
+  xlab("UMAP 1") + 
+  ylab("UMAP 2") + 
+  NoLegend() +
+  theme(
+    axis.title = element_text(size = 20),
+    axis.text = element_text(size = 15)
+  )
+ggsave("~/Desktop/BM_UMAP_master_integrated.png", plot = UMAP_master, width = 12, height = 8, dpi = 300)
+UMAP_split <- DimPlot(integ_final, split.by = "which_sample", ncol = 2, reduction = "umap", label = FALSE) + 
+  xlab("UMAP 1") + 
+  ylab("UMAP 2") + 
+  theme(
+    axis.title = element_text(size = 20),
+    axis.text = element_text(size = 15),
+    strip.text = element_text(size = 18),
+    legend.text = element_text(size = 15),
+    legend.title = element_text(size = 18)
+  )
+ggsave("~/Desktop/BM_UMAP_split_integrated.png", plot = UMAP_split, width = 14, height = 8, dpi = 300)
+
+rm(list = setdiff(ls(), "integ_final"))
+gc()
+
+save(integ_final, file = "~/Documents/LOOTS_DATA/BM_bone_mass_integ_object.RData")
+load("~/Documents/LOOTS_DATA/BM_bone_mass_integ_object.RData")
+
+```
+
+Filter out immune cells and remove clusters
+
+```{r IMMUNE}
+
+features <- c("Pecam1", "Ptprc", "Rgs5", "Hemgn")
+p1 <- FeaturePlot(integ_final, features = features, order = TRUE, ncol = 2) & 
+  xlab("UMAP 1") & 
+  ylab("UMAP 2") & 
+  theme(
+    plot.title = element_text(size = 20),
+    axis.title = element_text(size = 18),  
+    axis.text = element_text(size = 14),
+    legend.text = element_text(size = 12),
+    legend.key.size = unit(0.8, "cm")
+  )
+ggsave("~/Desktop/BM_feature_plot_immune_markers.png", plot = p1, width = 12, height = 10, dpi = 300)
+
+keep_clusters <- c("3","0","6","5","4","7","16","8","19")
+
+immune_removed <- subset(integ_final, idents = keep_clusters)
+immune_removed <- RunUMAP(immune_removed, reduction = "pca", dims = 1:20)
+immune_removed <- FindNeighbors(immune_removed, reduction = "pca", dims = 1:20)
+immune_removed <- FindClusters(immune_removed, resolution = 0.4)
+
+UMAP_master <- DimPlot(immune_removed, reduction = "umap", label = TRUE, repel = TRUE, label.size = 9, label.box = TRUE, pt.size = 1.0) + 
+  xlab("UMAP 1") + 
+  ylab("UMAP 2") + 
+  NoLegend() +
+  theme(
+    axis.title = element_text(size = 20),
+    axis.text = element_text(size = 15)
+  )
+ggsave("~/Desktop/BM_UMAP_master_immune_removed.png", plot = UMAP_master, width = 12, height = 8, dpi = 300)
+UMAP_split <- DimPlot(immune_removed, split.by = "which_sample", ncol = 2, reduction = "umap", label = FALSE, pt.size = 1.0) + 
+  xlab("UMAP 1") + 
+  ylab("UMAP 2") + 
+  theme(
+    axis.title = element_text(size = 20),
+    axis.text = element_text(size = 15),
+    strip.text = element_text(size = 18),
+    legend.text = element_text(size = 15),
+    legend.title = element_text(size = 18)
+  )
+ggsave("~/Desktop/BM_UMAP_split_immune_removed.png", plot = UMAP_split, width = 12, height = 8, dpi = 300)
+
+
+rm(list = setdiff(ls(), "immune_removed"))
+gc()
+
+```
+
+Identify and plot all marker genes for each cluster
+
+```{r MARKERS}
+
+DefaultAssay(immune_removed) <- "RNA"
+
+bone_markers <- c(
+  "Runx2", "Lifr", "Postn", "Mmp13", "Alpl",
+  "Col1a2", "Col1a1", "Bglap", "Bglap2", "Mepe",
+  "Sost", "Dmp1", "Dkk1", "Epcam", "Tnfrsf11b",
+  "Omd", "Cytl1", "Prg4", "Frzb", "Lepr", "Kitl",
+  "Adipoq", "Cxcl12", "Lpl", "Ucma", "Matn3", "Acan",
+  "Col2a1", "Hapln1", "Gsn", "Dcn", "Col14a1", "S100a4",
+  "Col3a1", "Pdpn", "Pdgfa", "Cd109", "Phex", "Bambi"
+)
+
+feature_markers <- c("Postn", "Bglap", "Sost", "Cxcl12", "S100a4", "Col2a1")
+
+p1 <- FeaturePlot(immune_removed, features = feature_markers, order = TRUE, ncol = 2) & 
+  xlab("UMAP 1") & 
+  ylab("UMAP 2") & 
+  theme(
+    plot.title = element_text(size = 20),
+    axis.title = element_text(size = 18),  
+    axis.text = element_text(size = 14),
+    legend.text = element_text(size = 12),
+    legend.key.size = unit(0.8, "cm")
+  )
+ggsave("~/Desktop/BM_feature_plot_bone_markers.png", plot = p1, width = 12, height = 10, dpi = 300)
+
+p2 <- DotPlot(immune_removed, features = bone_markers) + 
+           RotatedAxis()
+ggsave("~/Desktop/BM_dotplot_bone_markers.png", plot = p2, width = 15, height = 8, dpi = 300)
+
+# integ_subset <- subset(immune_removed, idents = c("7", "6"))
+# integ_subset <- JoinLayers(integ_subset)
+# integ_subset <- NormalizeData(integ_subset)
+# markers <- FindAllMarkers(integ_subset, 
+#                            only.pos = TRUE, 
+#                            min.pct = 0.25,
+#                            logfc.threshold = 0.25)
+# top_markers <- markers[markers$p_val_adj < 0.05, ]
+# # top_markers$unique <- !duplicated(top_markers$gene) & 
+# #                       !duplicated(top_markers$gene, fromLast = TRUE)
+# write.csv(top_markers, "~/Desktop/BM_7_marker_genes.csv")
+
+rm(list = setdiff(ls(), "immune_removed"))
+gc()
+
+```
+
+Identify population shifts
+
+```{r SHIFTS}
+
+integ_final_annotated <- RenameIdents(immune_removed,
+    '0' = "pOB",
+    '1' = "OCY",
+    '2' = "OB",      
+    '3' = "MP_FB",
+    '4' = "OCP",
+    '5' = "aCAR",
+    '6' = "CH",
+    '7' = "CH", 
+    '8' = "MP_FB",
+    '9' = "OCP",   
+    '10' = "aCAR",
+    '11' = "OB_OCY",
+    '12' = "pOB"
+)
+
+integ_final_annotated$cell_type <- Idents(integ_final_annotated)
+
+
+UMAP_master <- DimPlot(integ_final_annotated, reduction = "umap", label = TRUE, repel = TRUE, label.size = 9, label.box = TRUE, pt.size = 1.0) + 
+  xlab("UMAP 1") + 
+  ylab("UMAP 2") + 
+  NoLegend() +
+  theme(
+    axis.title = element_text(size = 20),
+    axis.text = element_text(size = 15)
+  )
+ggsave("~/Desktop/BM_UMAP_master_annotated.png", plot = UMAP_master, width = 12, height = 8, dpi = 300)
+UMAP_split <- DimPlot(integ_final_annotated, split.by = "which_sample", ncol = 2, reduction = "umap", label = FALSE, pt.size = 1.0) + 
+  xlab("UMAP 1") + 
+  ylab("UMAP 2") + 
+  theme(
+    axis.title = element_text(size = 20),
+    axis.text = element_text(size = 15),
+    strip.text = element_text(size = 18),
+    legend.text = element_text(size = 15),
+    legend.title = element_text(size = 18)
+  )
+ggsave("~/Desktop/BM_UMAP_split_integrated_annotated.png", plot = UMAP_split, width = 12, height = 8, dpi = 300)
+
+
+
+cell_stats <- as.data.frame(prop.table(table(Idents(integ_final_annotated), 
+                                             integ_final_annotated$which_sample), margin = 2) * 100)
+colnames(cell_stats) <- c("Type", "Strain", "Percent")
+
+cell_types_ordered <- levels(Idents(integ_final_annotated))
+comparisons <- list("AJ" = c("B6", "AJ"), "MRL" = c("B6", "MRL"), "NZW" = c("B6", "NZW"))
+
+for (n in names(comparisons)) {
+  sub <- cell_stats[cell_stats$Strain %in% comparisons[[n]], ]
+  sub$Strain <- factor(sub$Strain, levels = c("B6", n))
+  
+  p <- ggplot(sub, aes(x = Strain, y = Percent, fill = Type)) +
+    geom_bar(stat = "identity", width = 0.7) +
+    theme_classic() +
+    theme(
+      text = element_text(size = 22),
+      axis.text = element_text(size = 20, color = "black"),
+      axis.title = element_text(size = 24),
+      legend.text = element_text(size = 18)
+    ) +
+    geom_text(aes(label = ifelse(Percent > 2, paste0(round(Percent, 1), "%"), "")), 
+              position = position_stack(vjust = 0.5), size = 7, fontface = "bold")
+  
+  ggsave(paste0("~/Desktop/BM_pop_", n, ".png"), plot = p, width = 10, height = 10, dpi = 300)
+  
+  b6 <- sub[sub$Strain == "B6", ]
+  other <- sub[sub$Strain == n, ]
+  tab <- merge(b6, other, by = "Type", suffixes = c("_B6", paste0("_", n)))
+  tab <- tab[match(cell_types_ordered, tab$Type), ]
+  
+  tab$Relative_Change_Percent <- round(((tab[, paste0("Percent_", n)] - tab$Percent_B6) / (tab$Percent_B6 + 1e-6)) * 100, 2)
+  tab$Direction <- ifelse(tab$Relative_Change_Percent > 0, "Increased", 
+                          ifelse(tab$Relative_Change_Percent < 0, "Decreased", "No Change"))
+  
+  write.csv(tab[, c("Type", "Relative_Change_Percent", "Direction")], 
+            paste0("~/Desktop/BM_stats_", n, ".csv"), row.names = FALSE)
+}
+
+rm(list = setdiff(ls(), "integ_final_annotated"))
+gc()
+
+save(integ_final_annotated, file = "~/Documents/LOOTS_DATA/BM_bone_mass_integ_object_annotated.RData")
+load("~/Documents/LOOTS_DATA/BM_bone_mass_integ_object_annotated.RData")
+
+```
+
+Do simple DGE comparisons for single replicates
+
+```{r DGE}
+
+comparison_merge <- JoinLayers(integ_final_annotated)
+cell_types <- levels(comparison_merge)
+comparisons <- list(
+  c("AJ", "B6"),
+  c("AJ", "MRL"),
+  c("AJ", "NZW"),
+  c("B6", "MRL"),
+  c("B6", "NZW"),
+  c("MRL", "NZW")
+)
+
+for (ct in cell_types) {
+  subset_type <- subset(comparison_merge, idents = ct)
+  for (comp in comparisons) {
+    degs <- FindMarkers(subset_type, ident.1 = comp[1], ident.2 = comp[2], group.by = "which_sample")
+    write.csv(degs, paste0("~/Desktop/DEGs_", ct, "_", comp[1], "_vs_", comp[2], ".csv"))
+  }
+}
+
+sub_obj <- JoinLayers(sub_obj)
+
+sub_obj <- subset(integ_final_annotated, idents = "pOB")
+DEGs <- c("Col6a2", "Cdk8", "Htra1", "Camk1d", "Cmss1", "Ftl1")
+p <- VlnPlot(sub_obj, 
+        features = DEGs, 
+        group.by = "cell_type", 
+        split.by = "which_sample", 
+        pt.size = 0, ncol = 3)
+ggsave("~/Desktop/BM_pOB_violin.png", plot = p, width = 20, height = 8, dpi= 300)
+
+sub_obj <- subset(integ_final_annotated, idents = "OCY")
+DEGs <- c("Aplp2", "Anxa7", "Rps2", "Ftl1-ps1" ,"Cdk8", "Rpl21")
+p <- VlnPlot(sub_obj,
+        features = DEGs,
+        group.by = "cell_type",
+        split.by = "which_sample",
+        pt.size = 0)
+ggsave("~/Desktop/BM_OCY_violin.png", plot = p, width = 12, height = 8, dpi= 300)
+
+sub_obj <- subset(integ_final_annotated, idents = "OB")
+DEGs <- c("Gm48099", "Camk1d", "Cmss1", "Gm10260", "Ftl1-ps1", "Kpna1")
+p <- VlnPlot(sub_obj,
+        features = DEGs,
+        group.by = "cell_type",
+        split.by = "which_sample",
+        pt.size = 0)
+ggsave("~/Desktop/BM_OB_violin.png", plot = p, width = 12, height = 8, dpi= 300)
+
+sub_obj <- subset(integ_final_annotated, idents = "MP_FB")
+DEGs <- c("Gm48099", "Cdk8", "Gm10260", "Ftl1-ps1", "Camk1d", "Kpna1")
+p <- VlnPlot(sub_obj,
+        features = DEGs,
+        group.by = "cell_type",
+        split.by = "which_sample",
+        pt.size = 0)
+ggsave("~/Desktop/BM_MP_FB_violin.png", plot = p, width = 12, height = 8, dpi= 300)
+
+sub_obj <- subset(integ_final_annotated, idents = "OCP")
+DEGs <- c("Cmss1", "Gm48099", "Camk1d", "Ftl1-ps1", "Pde4d", "Cdk8", "Ftl1", "Gm10260", "Kpna1", "Rpl21", "Rps2", "Ctsf")
+p <- VlnPlot(sub_obj,
+        features = DEGs,
+        group.by = "cell_type",
+        split.by = "which_sample",
+        pt.size = 0)
+ggsave("~/Desktop/BM_OCP_violin.png", plot = p, width = 12, height = 8, dpi= 300)
+
+sub_obj <- subset(integ_final_annotated, idents = "aCAR")
+DEGs <- c("Cam1kd", "Gm48099", "Gm10260", "Cmss1", "Ftl1-ps1", "Pde4d", "Kpna1", "Rpl21", "Rps2", "Ibsp", "Olfml3", "Cygb", "Ttc39b")
+p <- VlnPlot(sub_obj,
+        features = DEGs,
+        group.by = "cell_type",
+        split.by = "which_sample",
+        pt.size = 0)
+ggsave("~/Desktop/BM_aCAR_violin.png", plot = p, width = 12, height = 8, dpi= 300)
+
+sub_obj <- subset(integ_final_annotated, idents = "OCY")
+DEGs <- c("Cdk8", "Mtus1", "Kansl1")
+p <- VlnPlot(sub_obj,
+        features = DEGs,
+        group.by = "cell_type",
+        split.by = "which_sample",
+        pt.size = 0)
+ggsave("~/Desktop/BM_OCY_violin.png", plot = p, width = 12, height = 8, dpi= 300)
+
+DEGs <- c("Cdk8", "Mtus1", "Kansl1")
+p <- VlnPlot(integ_final_annotated,
+        features = DEGs,
+        split.by = "which_sample",
+        ncol = 1,
+        pt.size = 0)
+ggsave("~/Desktop/BM_OCY_violin.png", plot = p, width = 12, height = 8, dpi= 300)
+
+```
